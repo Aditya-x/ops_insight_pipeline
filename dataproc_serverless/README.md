@@ -1,257 +1,122 @@
-# 🚀 Dataproc Serverless - Daily Ingestion Pipeline
+# 🤖 Automated Daily Incremental Ingestion (Dataproc Serverless)
 
-This pipeline uses **Dataproc Serverless** to process daily ticket data from GCS, leveraging your existing PySpark expertise.
+This module automates the daily processing of ticket data for Nov–Dec, simulating a real-world production environment where new data arrives daily.
 
 ---
 
-## 📊 Cost Estimation (with $200 Free Credits)
+## ⚡ Overview
 
-| Component | Per Run | 61 Days (Nov-Dec) | Notes |
-|-----------|---------|-------------------|-------|
-| **Dataproc Serverless** | ~$0.10-0.20 | ~$6-12 | 2-4 DCUs × 5 min × $0.06/DCU-hr |
-| **Cloud Function** | ~$0 | ~$0 | Free tier (2M/month) |
-| **Cloud Scheduler** | ~$0 | ~$0 | Free tier (3 jobs) |
-| **BigQuery** | ~$0.01 | ~$0.60 | Query processing |
-| **GCS** | ~$0 | ~$0 | Already in use |
-| **Total** | ~$0.15 | **~$10-15** | **Well within $200 budget!** |
+The core of this automation is a **stateful, self-healing pipeline** that:
+1.  Wakes up every day at **8:00 AM IST**.
+2.  Checks `ingestion_state` to see what was last processed.
+3.  Ingests the *next available day* from GCS.
+4.  Appends new rows to **fact tables** (O(1) cost).
+5.  Updates aggregations (Features, Agent Load, SLA Risk).
+6.  Prevents duplicates via built-in checks.
 
 ---
 
 ## 🏗️ Architecture
 
-```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│  Cloud Scheduler │────▶│  Cloud Function  │────▶│    Dataproc      │
-│  (Daily @ 8AM)   │     │  (Trigger)       │     │    Serverless    │
-│                  │     │                  │     │                  │
-│  asia-south1     │     │  256MB / 60s     │     │  PySpark Job     │
-└──────────────────┘     │  Submit batch    │     │  2-10 executors  │
-                         └──────────────────┘     └────────┬─────────┘
-                                                           │
-                         ┌─────────────────────────────────┼─────────────────┐
-                         │                                 ▼                 │
-                         │           ┌──────────────────────────────┐        │
-                         │           │         BigQuery             │        │
-                         │           │                              │        │
-                    ┌────┴────┐      │  • tickets_raw (append)     │        │
-                    │   GCS   │      │  • fact_tickets             │        │
-                    │         │◀─────│  • features_daily           │        │
-                    │ CSV per │      │  • backlog_daily            │        │
-                    │   day   │      │  • daily_agent_load         │        │
-                    └─────────┘      │  • ticket_sla_risk          │        │
-                                     │  • ingestion_state          │        │
-                                     └──────────────────────────────┘        │
-                                                                             │
-                         ┌───────────────────────────────────────────────────┘
-                         │
-                         ▼
-                    Dashboard
-                    (Looker Studio)
+```mermaid
+graph LR
+    Scheduler(Cloud Scheduler) -->|Trigger| Function(Cloud Function)
+    Function -->|Submit Batch| Dataproc(Dataproc Serverless)
+    dates[Last Date Processed]
+    Dataproc -->|Read State| dates
+    Dataproc -->|Write Day N+1| BigQuery[(BigQuery)]
+    Dataproc -->|Update State| dates
 ```
 
 ---
 
-## 📁 Files
+## 🚀 Deployment & Operations
 
-```
-dataproc_serverless/
-├── daily_incremental_job.py      # Main PySpark job for Dataproc Serverless
-├── trigger_function/
-│   ├── main.py                   # Cloud Function to trigger batch
-│   └── requirements.txt          # Function dependencies
-├── deploy.ps1                    # One-click deployment (PowerShell)
-└── README.md                     # This file
-```
-
----
-
-## 🚀 Deployment
-
-### Prerequisites
-
-1. **Google Cloud SDK** installed and authenticated
-2. **$200 free credits** (or billing enabled)
-
-### One-Command Deployment
+### One-Click Deployment
+To deploy or update the pipeline:
 
 ```powershell
-cd d:\Data_Analysis\tickets-de-proj\dataproc_serverless
-.\deploy.ps1
+./deploy.ps1
 ```
+This script handles: API enablement, Service Account creation, Code upload to GCS, Function deployment, and Scheduler creation.
 
-This script will:
-1. ✅ Enable required APIs
-2. ✅ Create service account with proper permissions
-3. ✅ Upload PySpark job to GCS
-4. ✅ Deploy Cloud Function
-5. ✅ Create Cloud Scheduler (8:00 AM IST daily)
+### Manual Operations
 
----
-
-## 🧪 Testing
-
-### Test the full pipeline manually:
-
-```powershell
-# Option 1: Trigger via Cloud Scheduler
+#### 1. Trigger an immediate run
+If you missed a day or want to fast-forward:
+```bash
 gcloud scheduler jobs run daily-ticket-ingestion-scheduler --location=asia-south1
-
-# Option 2: Trigger Cloud Function directly
-$url = gcloud functions describe trigger-daily-ingestion --region=asia-south1 --format='value(serviceConfig.uri)'
-Invoke-RestMethod -Uri $url -Method GET
 ```
 
-### Process a specific date:
+#### 2. Process specific date (Override)
+To re-process a specific date:
+```bash
+# Get Function URL
+echo "URL: $(gcloud functions describe trigger-daily-ingestion --region=asia-south1 --format='value(serviceConfig.uri)')"
 
-```powershell
-# Trigger with specific date
-Invoke-RestMethod -Uri $url -Method POST -ContentType "application/json" -Body '{"date": "2023-11-01"}'
+# Trigger via curl
+curl -X POST <URL> -H "Content-Type: application/json" -d '{"date": "2023-11-01"}'
 ```
 
-### Submit PySpark job directly (for testing):
-
-```powershell
-gcloud dataproc batches submit pyspark `
-    gs://ops-tickets-files/spark_jobs/daily_incremental_job.py `
-    --region=asia-south1 `
-    --jars=gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.12-0.32.2.jar `
-    --service-account=dataproc-sa@biz-ops-031099.iam.gserviceaccount.com `
-    -- --date 2023-11-01
+#### 3. Reset a date (Wipe & Retry)
+If data is corrupted for `2023-11-01`, run this script to clean up all related tables:
+```bash
+python fix_duplicate_date.py
 ```
+*(Defaults to Nov 1. Edit the script to target other dates.)*
 
 ---
 
-## 📈 Monitoring
+## 🔍 Monitoring
 
-### View running/completed batch jobs:
-
-```powershell
-# List all batches
-gcloud dataproc batches list --region=asia-south1
-
-# View specific batch
-gcloud dataproc batches describe BATCH_ID --region=asia-south1
-
-# View batch logs
-gcloud dataproc batches wait BATCH_ID --region=asia-south1
-```
-
-### Check ingestion progress in BigQuery:
-
+### Check Progress
+Run this query in BigQuery to see the daily ingestion log:
 ```sql
--- View latest ingestions
-SELECT * 
-FROM `biz-ops-031099.ops_analytics.ingestion_state`
-ORDER BY simulation_date DESC
-LIMIT 10;
-
--- Check days remaining
 SELECT 
-    MAX(simulation_date) as last_processed,
-    DATE_DIFF(DATE('2023-12-31'), MAX(simulation_date), DAY) as days_remaining
-FROM `biz-ops-031099.ops_analytics.ingestion_state`;
+    simulation_date, 
+    ingestion_timestamp, 
+    rows_ingested 
+FROM `ops_analytics.ingestion_state`
+ORDER BY simulation_date DESC
 ```
 
-### View Cloud Function logs:
-
-```powershell
-gcloud functions logs read trigger-daily-ingestion --region=asia-south1 --limit=50
-```
+### Logs & Debugging
+- **Function Logs:** `gcloud functions logs read trigger-daily-ingestion`
+- **Batch Job Logs:** Go to **Dataproc > Serverless > Batches** in Cloud Console.
 
 ---
 
-## ⚙️ Configuration
+## 🛡️ Key Features
 
-### Change processing schedule:
+### 1. Incremental Optimization
+Instead of overwriting the entire table daily, the job:
+- **Filters** only the new day's data in memory.
+- **Appends** directly to `fact_tickets` and derived tables.
+- **Zero-History Reads:** No need to read `tickets_raw` again.
 
-Edit `deploy.ps1`:
-```powershell
---schedule="0 9 * * *"   # 9:00 AM instead of 8:00 AM
---schedule="0 */6 * * *" # Every 6 hours (faster simulation)
-```
-
-### Adjust Dataproc resources:
-
-Edit `trigger_function/main.py`:
+### 2. Duplicate Prevention
+Before processing, the job runs a check:
 ```python
-"spark.dynamicAllocation.minExecutors": "4",   # More min executors
-"spark.dynamicAllocation.maxExecutors": "20",  # More max executors
+if check_if_date_exists(spark, "2023-11-02"):
+    print("🛑 Skipping ingestion for 2023-11-02 to prevent duplicates.")
+    return
 ```
+This makes the pipeline idempotent—safe to retry multiple times.
 
-### Reset and start from scratch:
-
-```sql
--- In BigQuery Console
-TRUNCATE TABLE `biz-ops-031099.ops_analytics.ingestion_state`;
-```
+### 3. State Tracking
+The pipeline maintains its own cursor in `ingestion_state`. It automatically picks up where it left off, handling weekends or downtime gracefully.
 
 ---
 
-## 🆚 Why Dataproc Serverless?
+## 📂 Configuration
 
-| Feature | Cloud Functions | Dataproc Serverless |
-|---------|-----------------|---------------------|
-| **Your existing code** | Need to rewrite | ✅ Reuse PySpark skills |
-| **Spark support** | ❌ No | ✅ Yes |
-| **Max runtime** | 60 min | ✅ 24 hours |
-| **Memory** | 32 GB max | ✅ Unlimited (scales) |
-| **Debugging** | Limited | ✅ Full Spark UI |
-| **Cost** | $0 | ~$0.10-0.20/run |
+| Parameter | Value | Location |
+|-----------|-------|----------|
+| **Schedule** | `0 8 * * *` (8 AM IST) | `deploy.ps1` |
+| **Region** | `asia-south1` (Mumbai) | `deploy.ps1` / `main.py` |
+| **Start Date** | `2023-11-01` | `daily_incremental_job.py` |
+| **Max Executors** | 10 (Auto-scaling) | `main.py` |
 
 ---
 
-## 🛑 Stopping the Pipeline
-
-```powershell
-# Pause scheduler (keeps job, stops execution)
-gcloud scheduler jobs pause daily-ticket-ingestion-scheduler --location=asia-south1
-
-# Resume later
-gcloud scheduler jobs resume daily-ticket-ingestion-scheduler --location=asia-south1
-
-# Delete everything
-gcloud scheduler jobs delete daily-ticket-ingestion-scheduler --location=asia-south1
-gcloud functions delete trigger-daily-ingestion --region=asia-south1
-```
-
----
-
-## 🔄 Fast-Forward Testing
-
-Want to process all 61 days quickly? Run this in a loop:
-
-```powershell
-# Process multiple days rapidly
-$url = gcloud functions describe trigger-daily-ingestion --region=asia-south1 --format='value(serviceConfig.uri)'
-
-# Loop through dates
-$startDate = [datetime]"2023-11-01"
-$endDate = [datetime]"2023-12-31"
-
-for ($d = $startDate; $d -le $endDate; $d = $d.AddDays(1)) {
-    $dateStr = $d.ToString("yyyy-MM-dd")
-    Write-Host "Processing $dateStr..."
-    Invoke-RestMethod -Uri $url -Method POST -ContentType "application/json" -Body "{`"date`": `"$dateStr`"}"
-    Start-Sleep -Seconds 30  # Wait for job to complete
-}
-```
-
----
-
-## 💡 Tips
-
-1. **Monitor costs** in Cloud Console → Billing → Reports
-2. **Set budget alerts** to avoid surprises
-3. **Use Spark UI** (in Dataproc Console) to debug performance issues
-4. **Check batch status** before running next day to avoid duplicates
-
----
-
-## 📅 Timeline
-
-With daily runs at 8 AM IST:
-- **Nov 1 - Nov 30**: Day 1-30
-- **Dec 1 - Dec 31**: Day 31-61
-- **Completion**: ~2 months of real time
-
-For faster simulation, increase scheduler frequency or use the fast-forward script above!
+*Documentation updated for production build.*
